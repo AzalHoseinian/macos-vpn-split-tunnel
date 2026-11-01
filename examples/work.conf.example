@@ -1,0 +1,33 @@
+# Example profile — copy to ~/.config/vpn-split/<name>.conf and edit.
+# Addresses here are documentation ranges (RFC 5737) and route nowhere real.
+
+# Names the log (/tmp/vpn-split-<NAME>.log) and state file. Keep it short.
+NAME="work"
+
+# How to find the VPN's interface. Most reliable form first:
+#
+#   service:<provider-id>  Preferred. Resolves through the system VPN service,
+#                          so it survives utun/ppp renumbering. Get the id
+#                          from scripts/vpn-discover.sh — it is either a
+#                          provider bundle id (com.vendor.vpnclient) or a
+#                          fixed key some clients register themselves.
+#   subnet:<prefix>        When the client registers no visible service. Use
+#                          the prefix the VPN hands its clients, e.g. 10.8.
+#   iface:<name>           Only when the name is known to be stable. Fragile.
+MATCH="service:com.example.vpnclient"
+
+# The VPN's own server address, pinned to the physical gateway so the
+# handshake never disappears into another tunnel. Leave empty if the server
+# is a public address reachable regardless of routing.
+VPN_SERVER="203.0.113.10"
+
+# Only these go through the VPN. Hosts and CIDR subnets, space-separated.
+DESTS="10.20.0.0/16 198.51.100.7"
+
+# 1 if this client is full-tunnel — i.e. vpn-discover.sh shows 0.0.0.0/1 and
+# 128.0.0.0/1 on its interface. The guard removes those on every pass.
+KILL_DEFAULT=0
+
+# Physical interfaces to search for the underlay gateway, in order.
+# The default covers en0-en7; narrow it if you know which one you use.
+# UNDERLAY_IFACES="en0 en1"

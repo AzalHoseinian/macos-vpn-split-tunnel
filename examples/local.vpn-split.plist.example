@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copy to ~/Library/LaunchAgents/local.vpn-split-<name>.plist and replace:
+    <name>      the profile's NAME
+    <username>  your short user name
+
+  Then load it:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.vpn-split-<name>.plist
+
+  Point ProgramArguments at a stable location (~/bin, /usr/local/bin) rather
+  than a directory that may move.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.vpn-split-NAME</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/USERNAME/bin/vpn-guard.sh</string>
+    <string>/Users/USERNAME/.config/vpn-split/NAME.conf</string>
+  </array>
+
+  <!-- Every 20s. The guard exits silently when nothing needs doing, so this
+       is cheap; lengthen it if you prefer slower repair. -->
+  <key>StartInterval</key>
+  <integer>20</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/vpn-split-NAME.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/vpn-split-NAME.log</string>
+</dict>
+</plist>
