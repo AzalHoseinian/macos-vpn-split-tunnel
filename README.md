@@ -1,5 +1,11 @@
 # macOS VPN split tunneling
 
+**macOS only.** Interface identification is built on `scutil` and the system
+configuration store, and the watchdog on `launchctl` — neither has a Windows
+or Linux counterpart. The *diagnosis* in
+[`references/troubleshooting.md`](references/troubleshooting.md) is mostly
+platform-independent and worth reading anywhere.
+
 Send only the hosts that need a VPN through it, and keep everything else on
 its normal path — then make that survive reconnects, sleep, DHCP changes and
 reboots.
