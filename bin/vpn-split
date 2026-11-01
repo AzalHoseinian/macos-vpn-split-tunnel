@@ -1,0 +1,425 @@
+#!/bin/bash
+# vpn-split — split-tunnel VPN routing for macOS.
+#
+#   vpn-split add              create a profile, interactively
+#   vpn-split list             profiles and whether their watchdog runs
+#   vpn-split status           where each destination actually goes
+#   vpn-split discover         every VPN service and its real interface
+#   vpn-split apply <name>     enforce one profile once
+#   vpn-split enable <name>    install and start its watchdog
+#   vpn-split disable <name>   stop and remove its watchdog
+#   vpn-split doctor [name]    work out why a VPN will not connect
+#   vpn-split allow-sudo       let the watchdog change routes unattended
+#
+# No Claude, no dependencies beyond what macOS ships.
+
+set -u
+VERSION="1.1.0"
+DIR="${VPN_SPLIT_DIR:-$HOME/.config/vpn-split}"
+LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENTS="$HOME/Library/LaunchAgents"
+
+b() { printf '\033[1m%s\033[0m' "$*"; }
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+
+die() { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
+
+helper() {   # locate a sibling script, installed or in-repo
+  local n="$1"
+  for p in "$LIBDIR/$n" "$LIBDIR/../scripts/$n" "$HOME/bin/$n"; do
+    [ -x "$p" ] && { echo "$p"; return 0; }
+  done
+  die "cannot find $n next to $LIBDIR"
+}
+
+load_profile() {
+  NAME=""; VPN_SERVER=""; VPN_SERVER_PORT=""; MATCH=""; DESTS=""; KILL_DEFAULT=0
+  UNDERLAY_IFACES="en0 en1 en2 en3 en4 en5 en6 en7"
+  # shellcheck disable=SC1090
+  . "$1"
+}
+
+profile_path() {
+  local p="$DIR/$1.conf"
+  [ -r "$p" ] || die "no profile named '$1' in $DIR"
+  echo "$p"
+}
+
+svc_addr() {
+  scutil <<EOF 2>/dev/null | awk '/^[[:space:]]*Addresses[[:space:]]*:/{a=1;next} a&&/:/{print $3;exit}'
+show State:/Network/Service/$1/IPv4
+EOF
+}
+
+iface_of_addr() {
+  [ -z "${1:-}" ] && return 1
+  local i
+  for i in $(ifconfig -l | tr ' ' '\n'); do
+    if ifconfig "$i" 2>/dev/null | awk -v a="$1" '/inet /{if($2==a) f=1} END{exit !f}'; then
+      echo "$i"; return 0
+    fi
+  done
+  return 1
+}
+
+underlay() {   # echoes "<iface> <gateway> <local-ip>"
+  local i g lip ifaces="${1:-en0 en1 en2 en3 en4 en5 en6 en7}"
+  for i in $ifaces; do
+    g=$(ipconfig getoption "$i" router 2>/dev/null)
+    [ -n "$g" ] && [ "$g" != "0.0.0.0" ] && {
+      lip=$(ifconfig "$i" 2>/dev/null | awk '/inet /{print $2; exit}')
+      echo "$i $g $lip"; return 0
+    }
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- add
+
+cmd_add() {
+  mkdir -p "$DIR"
+  echo
+  b "Connected VPN services"; echo
+  echo
+
+  # Collect every service that currently holds an address, from both the
+  # UUID-keyed list and the fixed keys some clients register themselves.
+  local -a ids kinds ifaces addrs
+  local n=0 line id kind name addr iface
+
+  while read -r line; do
+    id=$(printf '%s' "$line" | grep -oE '[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}')
+    [ -z "$id" ] && continue
+    kind=$(printf '%s' "$line" | grep -oE '\(([A-Za-z0-9._-]+\.[A-Za-z0-9._-]+)\)' | tr -d '()' | head -1)
+    [ -z "$kind" ] && continue
+    name=$(printf '%s' "$line" | sed -n 's/.*"\(.*\)".*/\1/p')
+    addr=$(svc_addr "$id"); [ -z "$addr" ] && continue
+    iface=$(iface_of_addr "$addr") || continue
+    n=$((n+1)); ids[n]="$kind"; kinds[n]="${name:-$kind}"; ifaces[n]="$iface"; addrs[n]="$addr"
+    printf '  %d) %-34s %-10s %s\n' "$n" "$kind" "$iface" "$addr"
+  done < <(scutil --nc list 2>/dev/null)
+
+  while read -r k; do
+    [ -z "$k" ] && continue
+    addr=$(svc_addr "$k"); [ -z "$addr" ] && continue
+    iface=$(iface_of_addr "$addr") || continue
+    n=$((n+1)); ids[n]="$k"; kinds[n]="$k"; ifaces[n]="$iface"; addrs[n]="$addr"
+    printf '  %d) %-34s %-10s %s\n' "$n" "$k" "$iface" "$addr"
+  done < <(scutil <<'EOF' 2>/dev/null | awk -F/ '/subKey/{print $4}' | grep -vE '^[0-9A-Fa-f]{8}-'
+list State:/Network/Service/.*/IPv4
+EOF
+)
+
+  if [ $n -eq 0 ]; then
+    echo "  (none)"
+    echo
+    warn "No VPN is connected, so its interface cannot be identified."
+    info "Connect the VPN you want to split, then run this again."
+    exit 1
+  fi
+
+  echo
+  local pick
+  read -r -p "Which one? [1-$n] " pick
+  [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le $n ] || die "invalid choice"
+
+  local match="service:${ids[$pick]}" vif="${ifaces[$pick]}"
+
+  local pname
+  read -r -p "Name for this profile [work]: " pname
+  pname="${pname:-work}"
+  [[ "$pname" =~ ^[A-Za-z0-9_-]+$ ]] || die "use letters, digits, - and _ only"
+
+  echo
+  echo "Which destinations should go through this VPN?"
+  echo "Hosts and subnets, space-separated, e.g.  10.20.0.0/16 198.51.100.7"
+  local dests
+  read -r -p "> " dests
+  [ -z "$dests" ] && die "at least one destination is needed"
+
+  echo
+  echo "The VPN's own server address, if you know it. Pinning it to your"
+  echo "physical gateway is what stops another VPN from swallowing the"
+  echo "handshake. Leave empty to skip."
+  local server sport
+  read -r -p "Server address: " server
+  if [ -n "$server" ]; then
+    read -r -p "Server port [443]: " sport; sport="${sport:-443}"
+  fi
+
+  # Full-tunnel clients announce themselves in the routing table.
+  local killdef=0
+  if netstat -rn -f inet | awk -v k="$vif" '($1=="0.0.0.0/1"||$1=="128.0.0.0/1") && $NF==k {f=1} END{exit !f}'; then
+    killdef=1
+    echo
+    warn "This client is taking the whole internet (0.0.0.0/1 on $vif)."
+    info "The profile will release that on every pass."
+  fi
+
+  local p="$DIR/$pname.conf"
+  [ -e "$p" ] && { read -r -p "$p exists. Overwrite? [y/N] " a; [ "$a" = y ] || exit 1; }
+
+  cat > "$p" <<EOF
+NAME="$pname"
+MATCH="$match"
+VPN_SERVER="$server"
+VPN_SERVER_PORT="${sport:-}"
+DESTS="$dests"
+KILL_DEFAULT=$killdef
+EOF
+
+  echo
+  ok "wrote $p"
+  echo
+  "$(helper vpn-guard.sh)" "$p"
+  echo
+  read -r -p "Keep this enforced automatically? [Y/n] " a
+  [ "${a:-y}" = n ] || cmd_enable "$pname"
+  echo
+  echo "Check it any time with:  $(b "vpn-split status")"
+}
+
+# ------------------------------------------------------------- enable
+
+plist_path() { echo "$AGENTS/local.vpn-split-$1.plist"; }
+
+cmd_enable() {
+  local name="${1:-}"; [ -z "$name" ] && die "usage: vpn-split enable <name>"
+  local p; p=$(profile_path "$name")
+  local guard; guard=$(helper vpn-guard.sh)
+  mkdir -p "$AGENTS"
+  cat > "$(plist_path "$name")" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.vpn-split-$name</string>
+  <key>ProgramArguments</key>
+  <array><string>$guard</string><string>$p</string></array>
+  <key>StartInterval</key><integer>20</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/tmp/vpn-split-$name.log</string>
+  <key>StandardErrorPath</key><string>/tmp/vpn-split-$name.log</string>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/local.vpn-split-$name" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$(plist_path "$name")" 2>/dev/null \
+    && ok "watchdog running (every 20s, log: /tmp/vpn-split-$name.log)" \
+    || bad "could not load the watchdog"
+
+  sudo -n route -n get 127.0.0.1 >/dev/null 2>&1 || {
+    echo
+    warn "sudo will ask for a password, which a background job cannot answer."
+    info "Run  vpn-split allow-sudo  so repairs work unattended."
+  }
+}
+
+cmd_disable() {
+  local name="${1:-}"; [ -z "$name" ] && die "usage: vpn-split disable <name>"
+  launchctl bootout "gui/$(id -u)/local.vpn-split-$name" 2>/dev/null \
+    && ok "stopped" || warn "was not running"
+  rm -f "$(plist_path "$name")" && ok "removed its LaunchAgent"
+  info "The profile itself is untouched; 'vpn-split enable $name' brings it back."
+}
+
+# --------------------------------------------------------- allow-sudo
+
+cmd_allow_sudo() {
+  cat <<'EOF'
+
+The watchdog changes routes, which needs root, and a background job has no
+terminal to type a password into. A narrow sudoers rule is what makes
+unattended repair possible:
+
+    <you> ALL=(root) NOPASSWD: /sbin/route
+
+Be clear-eyed about the trade-off. It lets anything running as you change the
+routing table without a password, so a compromised process could redirect your
+traffic. It is not general root access and it is much narrower than
+NOPASSWD: ALL, but it is a real widening of your exposure.
+
+Without it everything still works; you just run the commands yourself and lose
+automatic repair.
+
+EOF
+  read -r -p "Add the rule? [y/N] " a
+  [ "$a" = y ] || { echo "Skipped."; return 0; }
+  local f=/etc/sudoers.d/vpn-split
+  # visudo -c validates before anything lands in /etc/sudoers.d, so a typo
+  # here cannot lock you out of sudo.
+  local tmp; tmp=$(mktemp)
+  printf '%s ALL=(root) NOPASSWD: /sbin/route\n' "$(id -un)" > "$tmp"
+  if sudo visudo -c -f "$tmp" >/dev/null 2>&1; then
+    sudo install -m 0440 -o root -g wheel "$tmp" "$f" && ok "installed $f"
+  else
+    bad "the generated rule did not validate; nothing was changed"
+  fi
+  rm -f "$tmp"
+}
+
+# --------------------------------------------------------------- list
+
+cmd_list() {
+  shopt -s nullglob
+  local ps=("$DIR"/*.conf)
+  [ ${#ps[@]} -eq 0 ] && { echo "no profiles in $DIR"; echo "run: vpn-split add"; return 0; }
+  printf '  %-14s %-10s %-34s %s\n' "PROFILE" "WATCHDOG" "MATCH" "DESTINATIONS"
+  local p
+  for p in "${ps[@]}"; do
+    load_profile "$p"
+    local st="off"
+    launchctl print "gui/$(id -u)/local.vpn-split-$NAME" >/dev/null 2>&1 && st="on"
+    printf '  %-14s %-10s %-34s %s\n' "$NAME" "$st" "$MATCH" "$DESTS"
+  done
+}
+
+# ------------------------------------------------------------- doctor
+
+cmd_doctor() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    shopt -s nullglob
+    local ps=("$DIR"/*.conf)
+    [ ${#ps[@]} -eq 0 ] && die "no profiles; run: vpn-split add"
+    for p in "${ps[@]}"; do load_profile "$p"; cmd_doctor "$NAME"; echo; done
+    return 0
+  fi
+
+  local p; p=$(profile_path "$name"); load_profile "$p"
+  b "Diagnosing $NAME"; echo; echo
+
+  # --- is the VPN up at all?
+  local vif="" key addr
+  case "$MATCH" in
+    service:*)
+      key="${MATCH#service:}"
+      for id in $(scutil --nc list 2>/dev/null | grep -F "($key)" \
+                   | grep -oE '[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}') "$key"; do
+        addr=$(svc_addr "$id"); [ -z "$addr" ] && continue
+        vif=$(iface_of_addr "$addr") && break; vif=""
+      done;;
+    subnet:*)
+      for i in $(ifconfig -l | tr ' ' '\n' | grep -E '^(utun|ppp|ipsec)[0-9]+$'); do
+        ifconfig "$i" 2>/dev/null | awk '/inet /{print $2}' | grep -q "^${MATCH#subnet:}" && { vif="$i"; break; }
+      done;;
+    iface:*) ifconfig "${MATCH#iface:}" 2>/dev/null | grep -q 'inet ' && vif="${MATCH#iface:}";;
+  esac
+
+  if [ -n "$vif" ]; then
+    ok "VPN is connected on $vif"
+  else
+    bad "VPN is not connected"
+  fi
+
+  # --- can we reach its server, and by which path?
+  local u uif ugw ulip
+  if u=$(underlay "$UNDERLAY_IFACES"); then
+    read -r uif ugw ulip <<<"$u"
+    ok "underlay: $uif via $ugw (local $ulip)"
+  else
+    bad "no underlay gateway — this machine has no usable network path"
+    info "Nothing else can work until that is fixed."
+    return 1
+  fi
+
+  if [ -n "$VPN_SERVER" ]; then
+    local sif; sif=$(route -n get "$VPN_SERVER" 2>/dev/null | awk '/interface:/{print $2}')
+    if [ "$sif" = "$uif" ]; then
+      ok "server $VPN_SERVER routes over the underlay ($sif)"
+    elif [ -z "$sif" ]; then
+      bad "server $VPN_SERVER has no route at all"
+    else
+      bad "CASE 1: server $VPN_SERVER is routed through $sif, not $uif"
+      info "Another VPN owns that path, so the handshake disappears into its"
+      info "tunnel and the client reports a generic connection error."
+      info "Fix:  vpn-split apply $NAME"
+      return 1
+    fi
+
+    # Reachability, and the stale-route case that looks perfectly healthy.
+    local port="${VPN_SERVER_PORT:-443}"
+    if nc -z -G 6 -w 6 "$VPN_SERVER" "$port" >/dev/null 2>&1; then
+      ok "server reachable on port $port"
+    else
+      local tr; tr=$(traceroute -n -w 1 -q 1 -m 1 "$VPN_SERVER" 2>&1 | head -2)
+      if printf '%s' "$tr" | grep -q "Can't assign requested address"; then
+        bad "CASE 2: the route to $VPN_SERVER is stale"
+        info "It still reports the right gateway and interface, but it is bound"
+        info "to a local address this machine no longer has — your IP changed."
+        info "Fix:  vpn-split apply $NAME"
+        return 1
+      fi
+      warn "server not reachable on port $port"
+      info "If the routing above looks right, the server or the path to it may"
+      info "genuinely be down. Check with whoever runs the gateway."
+    fi
+  else
+    info "no VPN_SERVER set in the profile, skipping server checks"
+  fi
+
+  # --- are the destinations actually routed where we want them?
+  if [ -n "$vif" ]; then
+    local d got bad_dest=0
+    for d in $DESTS; do
+      got=$(route -n get "${d%%/*}" 2>/dev/null | awk '/interface:/{print $2}')
+      if [ "$got" = "$vif" ]; then ok "$d -> $vif"
+      else bad "$d -> ${got:-nowhere} (expected $vif)"; bad_dest=1; fi
+    done
+    [ $bad_dest -eq 1 ] && info "Fix:  vpn-split apply $NAME"
+
+    if [ "$KILL_DEFAULT" = "1" ] && \
+       netstat -rn -f inet | awk '$1=="0.0.0.0/1"||$1=="128.0.0.0/1"{f=1} END{exit !f}'; then
+      warn "the client has re-taken the whole internet (0.0.0.0/1 is back)"
+      info "Fix:  vpn-split apply $NAME"
+    fi
+  fi
+
+  # --- if the VPN is down, the client's own engine is the next suspect
+  if [ -z "$vif" ]; then
+    echo
+    b "CASE 3 — is the client's engine alive?"; echo
+    info "VPN clients commonly leave their window running while the background"
+    info "daemons are gone. Then clicking Connect reaches nothing, and the"
+    info "error message looks identical to a network problem."
+    info ""
+    info "Tell them apart by the client's log: if it has no new lines from the"
+    info "moment you pressed Connect, the request never got there."
+    info ""
+    info "Quitting and reopening the app is what restarts those daemons —"
+    info "a reboot usually does not, because they ship with RunAtLoad=false."
+    info ""
+    info "Processes currently running for common clients:"
+    local found=0 d
+    for d in /Library/Application\ Support/*/; do
+      [ -d "$d" ] || continue
+      case "$d" in *Apple*|*Microsoft*) continue;; esac
+      while IFS= read -r exe; do
+        pgrep -f "^$exe" >/dev/null 2>&1 && { info "  alive: $exe"; found=1; }
+      done < <(find "$d" -maxdepth 3 -type f -perm -u+x 2>/dev/null | head -40)
+    done
+    [ $found -eq 0 ] && info "  (none found under /Library/Application Support)"
+  fi
+}
+
+# -------------------------------------------------------------- main
+
+case "${1:-}" in
+  add)         shift; cmd_add "$@";;
+  list|ls)     shift; cmd_list "$@";;
+  status)      shift; VPN_SPLIT_DIR="$DIR" "$(helper vpn-status.sh)" "$@";;
+  discover)    shift; "$(helper vpn-discover.sh)" "$@";;
+  apply)       shift; [ -z "${1:-}" ] && die "usage: vpn-split apply <name>"
+               "$(helper vpn-guard.sh)" "$(profile_path "$1")";;
+  enable)      shift; cmd_enable "$@";;
+  disable)     shift; cmd_disable "$@";;
+  doctor)      shift; cmd_doctor "$@";;
+  allow-sudo)  shift; cmd_allow_sudo "$@";;
+  -v|--version) echo "vpn-split $VERSION";;
+  ""|-h|--help|help)
+    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//';;
+  *) die "unknown command: $1  (try: vpn-split help)";;
+esac

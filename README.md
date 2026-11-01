@@ -39,6 +39,8 @@ about the real cause.
 ## What's here
 
 ```
+bin/vpn-split                 the CLI — add, status, doctor, enable
+install.sh                    copies four scripts, touches nothing else
 SKILL.md                      instructions for Claude Code
 scripts/vpn-discover.sh       read-only: every VPN service and its real interface
 scripts/vpn-guard.sh          enforces one profile; run from a LaunchAgent
@@ -47,19 +49,81 @@ references/troubleshooting.md the three failure modes and how to tell them apart
 examples/                     profile and LaunchAgent templates
 ```
 
+No dependencies beyond what macOS ships. Works with or without Claude.
+
 ## Quick start
 
 ```bash
 git clone https://github.com/AzalHoseinian/macos-vpn-split-tunnel.git
 cd macos-vpn-split-tunnel
-chmod +x scripts/*.sh
+./install.sh
 ```
 
-Connect the VPN, then see what you have:
+Connect the VPN you want to split — its interface cannot be identified while
+it is down — then:
+
+```bash
+vpn-split add
+```
+
+It lists the VPNs that currently hold an address, asks which one and what
+should go through it, detects whether the client is full-tunnel, writes the
+profile and offers to keep it enforced:
+
+```
+  1) com.example.vpnclient             utun4      10.8.0.6
+  2) com.other.vpn                     ppp0       192.0.2.30
+
+Which one? [1-2] 1
+Name for this profile [work]: work
+Which destinations should go through this VPN?
+> 10.20.0.0/16 198.51.100.7
+Server address: 203.0.113.10
+
+  ! This client is taking the whole internet (0.0.0.0/1 on utun4).
+    The profile will release that on every pass.
+```
+
+### Everyday commands
+
+| | |
+|---|---|
+| `vpn-split status` | where each destination actually goes |
+| `vpn-split doctor` | work out why a VPN will not connect |
+| `vpn-split list` | profiles and whether their watchdog runs |
+| `vpn-split apply <name>` | enforce one profile right now |
+| `vpn-split enable/disable <name>` | start or stop its watchdog |
+| `vpn-split allow-sudo` | let repairs happen unattended |
+
+### `doctor` is the part worth having
+
+Clients report the same generic error for unrelated causes, so the message
+tells you nothing. `doctor` runs the checks that separate them and names the
+case:
+
+```
+$ vpn-split doctor work
+
+Diagnosing work
+
+  ✓ VPN is connected on utun4
+  ✓ underlay: en0 via 192.0.2.1 (local 192.0.2.44)
+  ✗ CASE 1: server 203.0.113.10 is routed through ppp0, not en0
+      Another VPN owns that path, so the handshake disappears into its
+      tunnel and the client reports a generic connection error.
+      Fix:  vpn-split apply work
+```
+
+It recognises the stale-route case too — the one where everything *looks*
+correct and nothing works — and when the VPN is simply down it points at the
+client's own daemons and shows which are alive.
+
+## Doing it by hand
+
+The scripts work on their own if you would rather not use the CLI.
 
 ```bash
 ./scripts/vpn-discover.sh
-```
 
 ```
 === Configured VPN services ===
@@ -81,15 +145,10 @@ DESTS="10.20.0.0/16 198.51.100.7"
 KILL_DEFAULT=1
 ```
 
-Apply it:
+Apply and verify — and do not trust the routing table alone:
 
 ```bash
 ./scripts/vpn-guard.sh ~/.config/vpn-split/work.conf
-```
-
-Verify — and do not trust the routing table alone:
-
-```bash
 ./scripts/vpn-status.sh
 ```
 
