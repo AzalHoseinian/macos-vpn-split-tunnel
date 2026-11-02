@@ -120,6 +120,47 @@ systemextensionsctl list | grep -i <vendor>
 
 ---
 
+## Case 4 — a client update quietly invalidated the profile
+
+**Symptom:** everything worked for weeks, the client updates, and now the
+tooling reports the VPN as disconnected even while it is plainly connected
+and carrying traffic.
+
+**Why:** vendors change their internals between versions. A client that used
+`pppd` and registered a fixed key in the dynamic store can move to a
+NetworkExtension provider with a UUID-keyed service, so the interface becomes
+a `utun` instead of a `ppp`, and the id `MATCH` is looking for stops existing.
+Nothing announces this — the VPN itself works fine, only the profile is now
+describing a client that is no longer there.
+
+Expect the log layout to change too. If the file you used to read stops
+growing and new ones appear beside it, you are reading the old version's logs
+and concluding, wrongly, that nothing is happening.
+
+**Fix:**
+
+```bash
+vpn-split discover          # with the VPN connected
+```
+
+Take the id it reports and update `MATCH` in the profile. `vpn-split doctor`
+recognises this case and says so rather than reporting a disconnected VPN.
+
+**Worth knowing for the diagnosis:** the new provider may install its own
+`default` route. Check the flags before assuming it has hijacked everything:
+
+```
+default  link#26  UCSg    utun7     <- no I: this is the global default
+default  link#25  UCSIg   utun4     <- I = ifscope, only for traffic bound there
+```
+
+An `I` flag means the route is interface-scoped and does not capture general
+traffic. `scutil` tells you which service actually wins:
+
+```bash
+scutil <<< "show State:/Network/Global/IPv4" | grep Primary
+```
+
 ## Traps worth remembering
 
 **An empty log is not a healthy log.** If the client logged nothing after the

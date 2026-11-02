@@ -313,6 +313,34 @@ cmd_doctor() {
     ok "VPN is connected on $vif"
   else
     bad "VPN is not connected"
+
+    # "Not connected" and "the profile no longer describes this client" look
+    # identical from here, and a client update is enough to cause the second:
+    # vendors change the service id and the tunnel method between versions,
+    # which silently stops MATCH resolving while everything else still works.
+    # Distinguish them, because the fixes have nothing in common.
+    case "$MATCH" in
+      service:*)
+        key="${MATCH#service:}"
+        if ! scutil --nc list 2>/dev/null | grep -qF "($key)" && [ -z "$(svc_addr "$key")" ]; then
+          echo
+          bad "CASE 4: the profile's MATCH no longer resolves"
+          info "'$key' is not a service this system knows about. If the client"
+          info "was updated, its service id or tunnel method may have changed."
+          info ""
+          info "Tunnel interfaces that currently hold an address:"
+          local any=0 ip
+          for i in $(ifconfig -l | tr ' ' '\n' | grep -E '^(utun|ppp|ipsec)[0-9]+$'); do
+            ip=$(ifconfig "$i" 2>/dev/null | awk '/inet /{print $2; exit}')
+            [ -n "$ip" ] && { info "  $i  $ip"; any=1; }
+          done
+          [ $any -eq 0 ] && info "  (none — so the VPN really is down)"
+          info ""
+          info "Run  vpn-split discover  and set MATCH to the id it reports."
+          return 1
+        fi
+        ;;
+    esac
   fi
 
   # --- can we reach its server, and by which path?
@@ -392,16 +420,28 @@ cmd_doctor() {
     info "Quitting and reopening the app is what restarts those daemons —"
     info "a reboot usually does not, because they ship with RunAtLoad=false."
     info ""
-    info "Processes currently running for common clients:"
-    local found=0 d
+    info "Background processes these clients are running right now:"
+    # Deliberately not a list of known daemon names: vendors rename them
+    # between versions, and a hardcoded list reports a dead engine when the
+    # new one is running perfectly well. Whatever is executing out of the
+    # vendor's own directory is the ground truth.
+    local found=0 d exe
     for d in /Library/Application\ Support/*/; do
       [ -d "$d" ] || continue
-      case "$d" in *Apple*|*Microsoft*) continue;; esac
+      case "$d" in *Apple*|*com.apple*|*Microsoft*) continue;; esac
       while IFS= read -r exe; do
-        pgrep -f "^$exe" >/dev/null 2>&1 && { info "  alive: $exe"; found=1; }
-      done < <(find "$d" -maxdepth 3 -type f -perm -u+x 2>/dev/null | head -40)
+        pgrep -f "^$exe" >/dev/null 2>&1 && { info "  $(basename "$exe")  ($(basename "$(dirname "$(dirname "$exe")")"))"; found=1; }
+      done < <(find "$d" -maxdepth 4 -type f -perm -u+x 2>/dev/null | head -60)
     done
-    [ $found -eq 0 ] && info "  (none found under /Library/Application Support)"
+    [ $found -eq 0 ] && info "  (none — the engine really is down)"
+    info ""
+    info "Most recent writes to their logs — a log that stopped at your last"
+    info "disconnect means the Connect click never reached anything:"
+    local lg
+    while IFS= read -r lg; do
+      info "  $(date -r "$lg" '+%m-%d %H:%M')  ${lg#/Library/Application Support/}"
+    done < <(find /Library/Application\ Support -maxdepth 4 -name '*.log' -mmin -1440 2>/dev/null \
+             | grep -viE 'apple|microsoft' | head -8)
   fi
 }
 
